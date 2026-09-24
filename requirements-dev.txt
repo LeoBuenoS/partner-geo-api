@@ -2,5 +2,5 @@
 pytest==8.3.*
 pytest-cov==6.*
 httpx==0.27.*
-black==25.*
+black==26.3.1  # versao exata: black 25.x e 26.x formatam diferente, e o CI rejeitaria
 flake8==7.*
