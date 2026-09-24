@@ -141,6 +141,24 @@ Os testes de `tests/db/` se pulam sozinhos sem `TEST_POSTGRES_URL` e rodam num
 job dedicado do CI, com o PostGIS como *service*. Por isso o piso de cobertura
 do job rápido é 90%: o adaptador PostGIS é coberto no outro job.
 
+## Validação independente
+
+Este código é escrito com apoio do Claude. Uma revisão feita pelo mesmo modelo
+que escreveu herda os mesmos pontos cegos — então todo diff passa por um
+segundo revisor, de outro fornecedor: um job de CI manda a mudança para o
+**Gemini** e publica a revisão no PR.
+
+O gate é estreito de propósito: só reprova em achado `blocker` **com cenário
+concreto de falha**. Achado vago é rebaixado automaticamente, falha de
+infraestrutura (cota, rede, chave) não trava o merge, e a etiqueta
+`gemini-override` libera um falso positivo. Revisão de LLM é sinal, não
+oráculo — e um gate que reprova por ruído é um gate que alguém desliga.
+
+Para ativar: crie o secret `GEMINI_API_KEY` no repositório. Sem ele, o job
+avisa e passa. Opcionalmente, a variável `GEMINI_MODEL` fixa um modelo; sem
+ela o script escolhe entre os que a conta tem, para não quebrar quando um
+nome é aposentado.
+
 ## Estado atual
 
 Esqueleto funcional: as três operações rodam fim a fim, com 43 testes rápidos

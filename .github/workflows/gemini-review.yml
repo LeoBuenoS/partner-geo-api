@@ -1,0 +1,115 @@
+name: Revisão independente (Gemini)
+
+# Segundo canal de validação: o código é escrito com apoio do Claude, e uma
+# revisão feita pelo mesmo modelo herdaria os mesmos pontos cegos. Este job
+# usa um modelo de outro fornecedor.
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Um PR novo cancela a revisão anterior: não faz sentido pagar por revisão de
+# um commit que já foi substituído.
+concurrency:
+  group: gemini-review-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  revisar:
+    name: Revisão do diff por um modelo de outro fornecedor
+    runs-on: ubuntu-latest
+    # Sem a chave configurada o job não roda — e não reprova nada.
+    if: github.actor != 'dependabot[bot]'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # precisa do histórico para calcular o diff
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verifica se a chave está configurada
+        id: chave
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "configurada=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GEMINI_API_KEY não está nos secrets do repositório; revisão pulada."
+          else
+            echo "configurada=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determina o intervalo a revisar
+        if: steps.chave.outputs.configurada == 'true'
+        id: intervalo
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            echo "base=origin/${{ github.base_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            # Push: revisa o que o push trouxe. No primeiro commit de um branch
+            # novo, `before` vem zerado — aí cai para o commit anterior.
+            antes="${{ github.event.before }}"
+            if [ -z "$antes" ] || [ "$antes" = "0000000000000000000000000000000000000000" ]; then
+              antes="HEAD~1"
+            fi
+            echo "base=$antes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Revisa o diff
+        if: steps.chave.outputs.configurada == 'true'
+        id: revisao
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Opcional: fixe um modelo criando a variável GEMINI_MODEL no
+          # repositório. Sem ela, o script escolhe entre os modelos que a sua
+          # conta tem — assim o CI não quebra quando um nome é aposentado.
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+        run: |
+          python .github/scripts/gemini_review.py \
+            --base "${{ steps.intervalo.outputs.base }}" \
+            --head "${{ github.sha }}" \
+            --saida revisao-gemini.md \
+            ${{ contains(github.event.pull_request.labels.*.name, 'gemini-override') && '--override' || '' }}
+
+      # O comentário é publicado mesmo quando o passo acima reprova: sem ele,
+      # o autor veria um CI vermelho sem saber o motivo.
+      - name: Publica a revisão no PR
+        if: always() && github.event_name == 'pull_request' && hashFiles('revisao-gemini.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const corpo = fs.readFileSync('revisao-gemini.md', 'utf8');
+            const marcador = '<!-- revisao-gemini -->';
+
+            const { data: comentarios } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const anterior = comentarios.find(
+              (c) => c.user.type === 'Bot' && c.body.includes(marcador)
+            );
+
+            // Edita o comentário anterior em vez de empilhar um por push.
+            const params = { owner: context.repo.owner, repo: context.repo.repo,
+                             body: `${marcador}\n${corpo}` };
+            if (anterior) {
+              await github.rest.issues.updateComment({ ...params, comment_id: anterior.id });
+            } else {
+              await github.rest.issues.createComment({ ...params, issue_number: context.issue.number });
+            }
+
+      - name: Resumo no job
+        if: always() && hashFiles('revisao-gemini.md') != ''
+        run: cat revisao-gemini.md >> "$GITHUB_STEP_SUMMARY"
