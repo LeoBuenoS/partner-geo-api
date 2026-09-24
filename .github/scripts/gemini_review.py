@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -119,22 +120,29 @@ def _requisitar(url: str, chave: str, corpo: dict | None = None) -> dict:
 ESPECIALIZADOS = ("embedding", "image", "vision", "tts", "aqa", "live", "native-audio")
 MAXIMO_DE_CANDIDATOS = 4
 
+# Sobrecarga e cota são transitórios: vale reesperar no mesmo modelo antes de
+# desistir dele. 404 não é transitório — o modelo saiu e não volta.
+TRANSITORIOS = (429, 503)
+TENTATIVAS_POR_MODELO = 2
+ESPERA_ENTRE_TENTATIVAS_S = 3
+
 
 def _pontuar(nome: str) -> tuple:
-    """Ordena candidatos: versão primeiro, depois capacidade, depois estabilidade.
+    """Ordena candidatos: capacidade, depois versão, depois estabilidade.
 
-    A versão vem antes da estabilidade de propósito. O modelo estável de hoje é
-    o aposentado de amanhã, e a API recusa o aposentado com 404 — foi
-    exatamente assim que a primeira execução deste job falhou, escolhendo um
-    "pro" estável de versão anterior em vez do preview mais novo.
+    Capacidade vem primeiro porque a tarefa é revisar código: um "pro" de
+    versão anterior revisa melhor que um "flash" mais novo. Estabilidade vem
+    por último — o estável de hoje é o aposentado de amanhã, e foi assim que a
+    primeira execução falhou, com 404 num "pro" que já tinha saído. Hoje isso
+    não trava mais: quem chama tenta o próximo candidato.
     """
     if any(t in nome for t in ESPECIALIZADOS):
-        return (-1.0, 0, 0)
+        return (-1, 0.0, 0)
+    capacidade = 2 if "pro" in nome else (1 if "flash" in nome else 0)
     casado = re.search(r"gemini-(\d+(?:\.\d+)?)", nome)
     versao = float(casado.group(1)) if casado else 0.0
-    capacidade = 2 if "pro" in nome else (1 if "flash" in nome else 0)
     estavel = 0 if any(t in nome for t in ("preview", "exp")) else 1
-    return (versao, capacidade, estavel)
+    return (capacidade, versao, estavel)
 
 
 def candidatos_de_modelo(chave: str, preferido: str | None) -> list[str]:
@@ -195,20 +203,32 @@ def revisar(chave: str, candidatos: list[str], diff: str) -> tuple[dict, str]:
 
     ultimo_erro = None
     for modelo in candidatos:
-        try:
-            resposta = _requisitar(
-                f"{API_RAIZ}/models/{modelo}:generateContent", chave, corpo
-            )
-        except urllib.error.HTTPError as erro:
-            # 404 = modelo listado mas indisponível (aposentado). Só esse caso
-            # justifica tentar outro: um 400 é erro de requisição — problema
-            # nosso, que seria mascarado se ficássemos varrendo a lista.
-            if erro.code != 404:
-                raise
-            ultimo_erro = erro.read().decode()[:300]
-            print(f"::notice::{modelo} indisponível, tentando o próximo")
-            continue
-        return _interpretar(resposta), modelo
+        for tentativa in range(1, TENTATIVAS_POR_MODELO + 1):
+            try:
+                resposta = _requisitar(
+                    f"{API_RAIZ}/models/{modelo}:generateContent", chave, corpo
+                )
+            except urllib.error.HTTPError as erro:
+                ultimo_erro = f"HTTP {erro.code}: {erro.read().decode()[:200]}"
+
+                # 400 é erro de requisição — problema nosso. Sobe na hora, em
+                # vez de ficar mascarado por uma varredura da lista inteira.
+                if erro.code not in (404, *TRANSITORIOS):
+                    raise
+
+                if erro.code == 404:
+                    print(f"::notice::{modelo} aposentado, tentando o próximo")
+                    break  # não adianta reesperar: não volta
+
+                if tentativa < TENTATIVAS_POR_MODELO:
+                    print(f"::notice::{modelo} sobrecarregado, reesperando")
+                    time.sleep(ESPERA_ENTRE_TENTATIVAS_S)
+                    continue
+
+                print(f"::notice::{modelo} segue sobrecarregado, tentando outro")
+                break
+            else:
+                return _interpretar(resposta), modelo
 
     raise RuntimeError(
         f"nenhum modelo aceitou a requisição ({', '.join(candidatos)}): {ultimo_erro}"
