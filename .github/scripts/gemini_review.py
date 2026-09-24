@@ -116,12 +116,34 @@ def _requisitar(url: str, chave: str, corpo: dict | None = None) -> dict:
         return json.loads(resposta.read().decode())
 
 
-def escolher_modelo(chave: str, preferido: str | None) -> str:
-    """Escolhe um modelo entre os que a conta realmente tem.
+ESPECIALIZADOS = ("embedding", "image", "vision", "tts", "aqa", "live", "native-audio")
+MAXIMO_DE_CANDIDATOS = 4
 
-    Nome de modelo cravado no código envelhece e quebra o CI sem aviso. Aqui a
-    lista vem da própria conta: se `GEMINI_MODEL` estiver definido, ele manda;
-    senão, escolhe o melhor disponível que suporte generateContent.
+
+def _pontuar(nome: str) -> tuple:
+    """Ordena candidatos: versão primeiro, depois capacidade, depois estabilidade.
+
+    A versão vem antes da estabilidade de propósito. O modelo estável de hoje é
+    o aposentado de amanhã, e a API recusa o aposentado com 404 — foi
+    exatamente assim que a primeira execução deste job falhou, escolhendo um
+    "pro" estável de versão anterior em vez do preview mais novo.
+    """
+    if any(t in nome for t in ESPECIALIZADOS):
+        return (-1.0, 0, 0)
+    casado = re.search(r"gemini-(\d+(?:\.\d+)?)", nome)
+    versao = float(casado.group(1)) if casado else 0.0
+    capacidade = 2 if "pro" in nome else (1 if "flash" in nome else 0)
+    estavel = 0 if any(t in nome for t in ("preview", "exp")) else 1
+    return (versao, capacidade, estavel)
+
+
+def candidatos_de_modelo(chave: str, preferido: str | None) -> list[str]:
+    """Modelos a tentar, do melhor para o pior.
+
+    Nome cravado no código envelhece e quebra o CI sem aviso, então a lista vem
+    da própria conta. Mas `ListModels` também devolve modelos aposentados, que
+    o `generateContent` recusa — por isso é uma LISTA, e não uma escolha só:
+    quem chama tenta o próximo quando um 404 diz que o modelo saiu.
     """
     resposta = _requisitar(f"{API_RAIZ}/models", chave)
     disponiveis = [
@@ -133,30 +155,20 @@ def escolher_modelo(chave: str, preferido: str | None) -> str:
         raise RuntimeError("nenhum modelo com generateContent nesta conta")
 
     if preferido:
-        if preferido in disponiveis:
-            return preferido
-        raise RuntimeError(
-            f"GEMINI_MODEL={preferido!r} não está disponível. "
-            f"Disponíveis: {', '.join(sorted(disponiveis))}"
-        )
+        if preferido not in disponiveis:
+            raise RuntimeError(
+                f"GEMINI_MODEL={preferido!r} não está disponível. "
+                f"Disponíveis: {', '.join(sorted(disponiveis))}"
+            )
+        return [preferido]  # escolha explícita manda, sem fallback
 
-    # Sem preferência explícita: prioriza a família "pro" (mais capaz), depois
-    # "flash", e dentro de cada uma a maior versão. Evita previews e modelos
-    # especializados (embedding, imagem, TTS).
-    def pontuar(nome: str) -> tuple:
-        if any(t in nome for t in ("embedding", "image", "vision", "tts", "aqa")):
-            return (-1, 0.0)
-        familia = 2 if "pro" in nome else (1 if "flash" in nome else 0)
-        estavel = 0 if any(t in nome for t in ("preview", "exp")) else 1
-        versao = re.search(r"(\d+(?:\.\d+)?)", nome)
-        return (familia, estavel, float(versao.group(1)) if versao else 0.0)
-
-    melhor = max(disponiveis, key=pontuar)
-    if pontuar(melhor)[0] < 0:
+    ordenados = [n for n in sorted(disponiveis, key=_pontuar, reverse=True)
+                 if _pontuar(n)[0] >= 0]
+    if not ordenados:
         raise RuntimeError(
             f"nenhum modelo de texto adequado. Disponíveis: {', '.join(disponiveis)}"
         )
-    return melhor
+    return ordenados[:MAXIMO_DE_CANDIDATOS]
 
 
 def _extrair_json(texto: str) -> dict:
@@ -174,13 +186,36 @@ def _extrair_json(texto: str) -> dict:
         return json.loads(limpo[inicio : fim + 1])
 
 
-def revisar(chave: str, modelo: str, diff: str) -> dict:
+def revisar(chave: str, candidatos: list[str], diff: str) -> tuple[dict, str]:
+    """Tenta cada candidato; um 404 significa modelo aposentado, então segue."""
     corpo = {
         "contents": [{"parts": [{"text": f"{INSTRUCOES}\n\n--- DIFF ---\n{diff}"}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-    resposta = _requisitar(f"{API_RAIZ}/models/{modelo}:generateContent", chave, corpo)
 
+    ultimo_erro = None
+    for modelo in candidatos:
+        try:
+            resposta = _requisitar(
+                f"{API_RAIZ}/models/{modelo}:generateContent", chave, corpo
+            )
+        except urllib.error.HTTPError as erro:
+            # 404 = modelo listado mas indisponível (aposentado). Só esse caso
+            # justifica tentar outro: um 400 é erro de requisição — problema
+            # nosso, que seria mascarado se ficássemos varrendo a lista.
+            if erro.code != 404:
+                raise
+            ultimo_erro = erro.read().decode()[:300]
+            print(f"::notice::{modelo} indisponível, tentando o próximo")
+            continue
+        return _interpretar(resposta), modelo
+
+    raise RuntimeError(
+        f"nenhum modelo aceitou a requisição ({', '.join(candidatos)}): {ultimo_erro}"
+    )
+
+
+def _interpretar(resposta: dict) -> dict:
     candidatos = resposta.get("candidates") or []
     if not candidatos:
         # Normalmente é bloqueio por filtro de segurança.
@@ -340,10 +375,13 @@ def main() -> int:
         print("Nenhuma mudança de código para revisar.")
         return 0
 
-    modelo = escolher_modelo(chave, os.environ.get("GEMINI_MODEL", "").strip() or None)
-    print(f"Revisando com {modelo} ({len(diff):,} caracteres de diff)")
+    candidatos = candidatos_de_modelo(
+        chave, os.environ.get("GEMINI_MODEL", "").strip() or None
+    )
+    print(f"Candidatos: {', '.join(candidatos)} ({len(diff):,} caracteres de diff)")
 
-    resultado = revisar(chave, modelo, diff)
+    resultado, modelo = revisar(chave, candidatos, diff)
+    print(f"Revisado por {modelo}")
     markdown = montar_markdown(resultado, modelo, truncado)
 
     with open(args.saida, "w", encoding="utf-8") as arquivo:
